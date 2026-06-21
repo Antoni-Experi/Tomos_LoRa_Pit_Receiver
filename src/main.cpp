@@ -26,9 +26,54 @@ uint32_t rxOkCount = 0;
 uint32_t emptyPacketCount = 0;
 uint32_t rxErrorCount = 0;
 int lastRadioLibError = 0;
+bool hasLastSeq = false;
+uint32_t lastSeq = 0;
+uint32_t lostPacketCount = 0;
+uint32_t seqParseErrorCount = 0;
+float lastRssi = 0.0f;
+float lastSnr = 0.0f;
+bool hasLastSignal = false;
 
 void setFlag() {
   receivedFlag = true;
+}
+
+bool parseSeqFromPayload(const String& payload, uint32_t& seqOut) {
+  int seqStart = payload.indexOf("seq=");
+  if (seqStart < 0) {
+    return false;
+  }
+
+  seqStart += 4;
+  if (seqStart >= static_cast<int>(payload.length())) {
+    return false;
+  }
+
+  uint32_t value = 0;
+  bool hasDigit = false;
+  for (size_t i = static_cast<size_t>(seqStart); i < payload.length(); i++) {
+    char character = payload[i];
+    if (character == ',') {
+      break;
+    }
+    if (character < '0' || character > '9') {
+      return false;
+    }
+
+    uint8_t digit = static_cast<uint8_t>(character - '0');
+    if (value > (0xFFFFFFFFUL - digit) / 10UL) {
+      return false;
+    }
+    value = value * 10UL + digit;
+    hasDigit = true;
+  }
+
+  if (!hasDigit) {
+    return false;
+  }
+
+  seqOut = value;
+  return true;
 }
 
 void setup() {
@@ -88,9 +133,22 @@ void loop() {
   unsigned long now = millis();
 
   if (now - last_status_print >= STATUS_INTERVAL) {
-    Serial.printf("RX status: %s, ok=%lu empty=%lu errors=%lu last_error=%d\n",
-                  lora_initialized ? "waiting" : "radio unavailable",
-                  rxOkCount, emptyPacketCount, rxErrorCount, lastRadioLibError);
+    uint32_t expectedPackets = rxOkCount + lostPacketCount;
+    float lossPercent = 0.0f;
+    if (expectedPackets > 0) {
+      lossPercent = 100.0f * lostPacketCount / expectedPackets;
+    }
+
+    if (hasLastSignal) {
+      Serial.printf("RX status: ok=%lu empty=%lu errors=%lu seq_errors=%lu lost=%lu loss=%.1f%% last_seq=%lu last_rssi=%.1f last_snr=%.1f last_error=%d\n",
+                    rxOkCount, emptyPacketCount, rxErrorCount, seqParseErrorCount,
+                    lostPacketCount, lossPercent, lastSeq, lastRssi, lastSnr,
+                    lastRadioLibError);
+    } else {
+      Serial.printf("RX status: ok=%lu empty=%lu errors=%lu seq_errors=%lu lost=%lu loss=%.1f%% last_seq=%lu last_rssi=n/a last_snr=n/a last_error=%d\n",
+                    rxOkCount, emptyPacketCount, rxErrorCount, seqParseErrorCount,
+                    lostPacketCount, lossPercent, lastSeq, lastRadioLibError);
+    }
     last_status_print = now;
   }
 
@@ -116,6 +174,35 @@ void loop() {
 
     if (payload.length() > 0) {
       rxOkCount++;
+      lastRssi = rssi;
+      lastSnr = snr;
+      hasLastSignal = true;
+
+      uint32_t seq = 0;
+      if (parseSeqFromPayload(payload, seq)) {
+        if (!hasLastSeq) {
+          lastSeq = seq;
+          hasLastSeq = true;
+        } else if (seq > lastSeq) {
+          uint32_t sequenceGap = seq - lastSeq;
+          if (sequenceGap > 1) {
+            lostPacketCount += sequenceGap - 1;
+          }
+          lastSeq = seq;
+        } else {
+          Serial.printf("WARNING: duplicate/out-of-order seq=%lu last_seq=%lu\n",
+                        seq, lastSeq);
+        }
+      } else {
+        seqParseErrorCount++;
+        Serial.println("WARNING: invalid or missing seq field");
+      }
+
+      uint32_t expectedPackets = rxOkCount + lostPacketCount;
+      float lossPercent = 0.0f;
+      if (expectedPackets > 0) {
+        lossPercent = 100.0f * lostPacketCount / expectedPackets;
+      }
 
       Serial.printf("\n>>> PACKET RECEIVED #%lu <<<\n", rxOkCount);
       Serial.printf("LEN: %u\n", static_cast<unsigned int>(payload.length()));
@@ -128,6 +215,9 @@ void loop() {
       Serial.printf("RSSI: %.2f dBm\n", rssi);
       Serial.printf("SNR: %.2f dB\n", snr);
       Serial.printf("Frequency Error: %.2f Hz\n", freq_error);
+      Serial.printf("LINK: rx_ok=%lu lost=%lu loss=%.1f%% last_seq=%lu seq_errors=%lu\n",
+                    rxOkCount, lostPacketCount, lossPercent, lastSeq,
+                    seqParseErrorCount);
       Serial.println("---\n");
     } else {
       emptyPacketCount++;
