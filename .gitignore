@@ -3,3 +3,9 @@
 .venv/
 venv/
 env/
+*.bin
+*.elf
+*.map
+*.log
+.DS_Store
+Thumbs.db
