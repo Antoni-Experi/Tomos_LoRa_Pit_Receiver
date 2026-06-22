@@ -1,5 +1,7 @@
 #include <Arduino.h>
+#include <Adafruit_SSD1306.h>
 #include <RadioLib.h>
+#include <Wire.h>
 #include <errno.h>
 #include <limits.h>
 #include "heltec_lora32_v4_pins.h"
@@ -14,10 +16,21 @@ const uint8_t LORA_CODING_RATE = 5;       // CR4/5
 const uint8_t LORA_SYNC_WORD = 0x12;      // Custom sync word
 const int16_t LORA_POWER = 14;             // dBm
 
+// Heltec WiFi LoRa 32 V4 OLED pins from Heltec's official V4 board definition.
+const uint8_t OLED_ADDRESS = 0x3C;
+const uint8_t OLED_SDA = 17;
+const uint8_t OLED_SCL = 18;
+const uint8_t OLED_RESET = 21;
+const uint8_t OLED_VEXT = 36;
+const uint16_t OLED_WIDTH = 128;
+const uint16_t OLED_HEIGHT = 64;
+const unsigned long DISPLAY_INTERVAL = 500; // At most two updates per second
+
 // RadioLib objects
 SPIClass spi;
 Module* radio_module = nullptr;
 SX1262* lora = nullptr;
+Adafruit_SSD1306 display(OLED_WIDTH, OLED_HEIGHT, &Wire, OLED_RESET);
 
 // State tracking
 bool lora_initialized = false;
@@ -35,6 +48,8 @@ uint32_t seqParseErrorCount = 0;
 float lastRssi = 0.0f;
 float lastSnr = 0.0f;
 bool hasLastSignal = false;
+bool displayInitialized = false;
+unsigned long lastDisplayUpdate = 0;
 uint32_t telemetryParseOkCount = 0;
 uint32_t telemetryParseErrorCount = 0;
 
@@ -53,6 +68,103 @@ struct TomosTelemetry {
 };
 
 TomosTelemetry lastTelemetry;
+
+float calculateLossPercent() {
+  uint32_t expectedPackets = rxOkCount + lostPacketCount;
+  if (expectedPackets == 0) {
+    return 0.0f;
+  }
+  return 100.0f * lostPacketCount / expectedPackets;
+}
+
+void showDisplayStartup() {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0, 0);
+  display.println("TOMOS PIT RX");
+  display.println("Waiting LoRa...");
+  display.display();
+}
+
+void initializeDisplay() {
+  // Vext powers the onboard OLED and is active LOW on this V4 revision.
+  pinMode(OLED_VEXT, OUTPUT);
+  digitalWrite(OLED_VEXT, LOW);
+  delay(100);
+
+  // Release the SSD1306 from reset before probing its I2C address.
+  pinMode(OLED_RESET, OUTPUT);
+  digitalWrite(OLED_RESET, HIGH);
+  delay(1);
+  digitalWrite(OLED_RESET, LOW);
+  delay(10);
+  digitalWrite(OLED_RESET, HIGH);
+  delay(10);
+
+  if (!Wire.begin(OLED_SDA, OLED_SCL, 400000)) {
+    Serial.println("OLED init FAIL - I2C initialization failed");
+    return;
+  }
+
+  Wire.beginTransmission(OLED_ADDRESS);
+  if (Wire.endTransmission() != 0) {
+    Serial.println("OLED init FAIL - display not found at I2C address 0x3C");
+    return;
+  }
+
+  // Wire is already configured with the V4 pins, so periphBegin stays false.
+  if (!display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDRESS, true, false)) {
+    Serial.println("OLED init FAIL - SSD1306 initialization failed");
+    return;
+  }
+
+  displayInitialized = true;
+  display.setTextWrap(false);
+  showDisplayStartup();
+  lastDisplayUpdate = millis();
+  Serial.println("OLED init SUCCESS (SDA=17, SCL=18, RST=21, Vext=36)");
+}
+
+void updateDisplay(unsigned long now) {
+  if (!displayInitialized || now - lastDisplayUpdate < DISPLAY_INTERVAL) {
+    return;
+  }
+  lastDisplayUpdate = now;
+
+  char line[24];
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0, 0);
+  display.println("TOMOS PIT RX");
+
+  if (!lastTelemetry.valid) {
+    display.println("Waiting...");
+    snprintf(line, sizeof(line), "RX: %lu", rxOkCount);
+    display.println(line);
+    snprintf(line, sizeof(line), "ERR: %lu", rxErrorCount + telemetryParseErrorCount);
+    display.println(line);
+  } else {
+    snprintf(line, sizeof(line), "SPD: %.1f km/h", lastTelemetry.speedKmh);
+    display.println(line);
+    if (lastTelemetry.fix) {
+      snprintf(line, sizeof(line), "GPS: %d H%.1f", lastTelemetry.satellites,
+               lastTelemetry.hdop);
+    } else {
+      snprintf(line, sizeof(line), "GPS: NO FIX");
+    }
+    display.println(line);
+    snprintf(line, sizeof(line), "LOSS: %.1f%%", calculateLossPercent());
+    display.println(line);
+    snprintf(line, sizeof(line), "RSSI: %.0f", lastRssi);
+    display.println(line);
+    snprintf(line, sizeof(line), "SNR: %.1f", lastSnr);
+    display.println(line);
+  }
+
+  display.display();
+}
 
 void setFlag() {
   receivedFlag = true;
@@ -239,6 +351,7 @@ void setup() {
   Serial.println("\n\n===============================================");
   Serial.println("Tomos Pit Receiver - Heltec WiFi LoRa 32 V4");
   Serial.println("===============================================");
+  initializeDisplay();
   Serial.printf("Initializing LoRa Receiver...\n");
   Serial.printf("Target Frequency: %.1f MHz\n", LORA_FREQ);
   Serial.printf("Bandwidth: %.0f kHz, SF: %d, CR: %d, Sync Word: 0x%02X\n",
@@ -287,12 +400,10 @@ void setup() {
 void loop() {
   unsigned long now = millis();
 
+  updateDisplay(now);
+
   if (now - last_status_print >= STATUS_INTERVAL) {
-    uint32_t expectedPackets = rxOkCount + lostPacketCount;
-    float lossPercent = 0.0f;
-    if (expectedPackets > 0) {
-      lossPercent = 100.0f * lostPacketCount / expectedPackets;
-    }
+    float lossPercent = calculateLossPercent();
 
     if (hasLastSignal) {
       Serial.printf("RX status: ok=%lu empty=%lu errors=%lu seq_errors=%lu telem_ok=%lu telem_errors=%lu lost=%lu loss=%.1f%% last_seq=%lu last_rssi=%.1f last_snr=%.1f last_error=%d\n",
@@ -366,11 +477,7 @@ void loop() {
         Serial.println("WARNING: invalid or missing seq field");
       }
 
-      uint32_t expectedPackets = rxOkCount + lostPacketCount;
-      float lossPercent = 0.0f;
-      if (expectedPackets > 0) {
-        lossPercent = 100.0f * lostPacketCount / expectedPackets;
-      }
+      float lossPercent = calculateLossPercent();
 
       Serial.printf("\n>>> PACKET RECEIVED #%lu <<<\n", rxOkCount);
       Serial.printf("LEN: %u\n", static_cast<unsigned int>(payload.length()));
@@ -388,6 +495,12 @@ void loop() {
                       telemetry.fix ? 1 : 0, telemetry.latitude, telemetry.longitude,
                       telemetry.speedKmh, telemetry.maxSpeedKmh, telemetry.satellites,
                       telemetry.hdop, telemetry.batteryVoltage, telemetry.time);
+        Serial.printf("{\"type\":\"telemetry\",\"time\":\"%s\",\"seq\":%lu,\"fix\":%s,\"lat\":%.6f,\"lon\":%.6f,\"spd\":%.1f,\"max\":%.1f,\"sat\":%d,\"hdop\":%.1f,\"vbat\":%.2f,\"rssi\":%.1f,\"snr\":%.1f,\"lost\":%lu,\"loss\":%.1f,\"rx_ok\":%lu}\n",
+                      telemetry.time, telemetry.seq, telemetry.fix ? "true" : "false",
+                      telemetry.latitude, telemetry.longitude, telemetry.speedKmh,
+                      telemetry.maxSpeedKmh, telemetry.satellites, telemetry.hdop,
+                      telemetry.batteryVoltage, rssi, snr, lostPacketCount,
+                      lossPercent, rxOkCount);
       }
       Serial.printf("LINK: rx_ok=%lu lost=%lu loss=%.1f%% last_seq=%lu seq_errors=%lu\n",
                     rxOkCount, lostPacketCount, lossPercent, lastSeq,
