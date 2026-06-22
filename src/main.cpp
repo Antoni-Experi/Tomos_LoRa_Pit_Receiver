@@ -1,5 +1,7 @@
 #include <Arduino.h>
 #include <RadioLib.h>
+#include <errno.h>
+#include <limits.h>
 #include "heltec_lora32_v4_pins.h"
 
 // LoRa frequency in MHz
@@ -33,9 +35,162 @@ uint32_t seqParseErrorCount = 0;
 float lastRssi = 0.0f;
 float lastSnr = 0.0f;
 bool hasLastSignal = false;
+uint32_t telemetryParseOkCount = 0;
+uint32_t telemetryParseErrorCount = 0;
+
+struct TomosTelemetry {
+  bool valid = false;
+  uint32_t seq = 0;
+  bool fix = false;
+  double latitude = 0.0;
+  double longitude = 0.0;
+  float speedKmh = 0.0f;
+  float maxSpeedKmh = 0.0f;
+  int satellites = 0;
+  float hdop = 99.99f;
+  float batteryVoltage = 0.0f;
+  char time[16] = "--:--:--";
+};
+
+TomosTelemetry lastTelemetry;
 
 void setFlag() {
   receivedFlag = true;
+}
+
+bool getFieldValue(const String& payload, const char* key, String& valueOut) {
+  String marker = String(",") + key + "=";
+  int valueStart = payload.indexOf(marker);
+  if (valueStart < 0) {
+    return false;
+  }
+
+  valueStart += marker.length();
+  int valueEnd = payload.indexOf(',', valueStart);
+  if (valueEnd < 0) {
+    valueEnd = payload.length();
+  }
+
+  if (valueStart >= valueEnd) {
+    return false;
+  }
+
+  valueOut = payload.substring(valueStart, valueEnd);
+  return true;
+}
+
+bool parseUnsigned32(const String& value, uint32_t& out) {
+  if (value.length() == 0 || value[0] == '-') {
+    return false;
+  }
+
+  errno = 0;
+  char* end = nullptr;
+  unsigned long parsed = strtoul(value.c_str(), &end, 10);
+  if (errno == ERANGE || end == value.c_str() || *end != '\0' ||
+      parsed > UINT32_MAX) {
+    return false;
+  }
+
+  out = static_cast<uint32_t>(parsed);
+  return true;
+}
+
+bool parseIntValue(const String& value, int& out) {
+  errno = 0;
+  char* end = nullptr;
+  long parsed = strtol(value.c_str(), &end, 10);
+  if (errno == ERANGE || end == value.c_str() || *end != '\0' ||
+      parsed < INT_MIN || parsed > INT_MAX) {
+    return false;
+  }
+
+  out = static_cast<int>(parsed);
+  return true;
+}
+
+bool parseDoubleValue(const String& value, double& out) {
+  errno = 0;
+  char* end = nullptr;
+  double parsed = strtod(value.c_str(), &end);
+  if (errno == ERANGE || end == value.c_str() || *end != '\0' || !isfinite(parsed)) {
+    return false;
+  }
+
+  out = parsed;
+  return true;
+}
+
+bool parseFloatValue(const String& value, float& out) {
+  errno = 0;
+  char* end = nullptr;
+  float parsed = strtof(value.c_str(), &end);
+  if (errno == ERANGE || end == value.c_str() || *end != '\0' || !isfinite(parsed)) {
+    return false;
+  }
+
+  out = parsed;
+  return true;
+}
+
+bool parseTomosTelemetry(const String& payload, TomosTelemetry& out,
+                         String& errorOut) {
+  out = TomosTelemetry();
+  if (!payload.startsWith("TOMOS,")) {
+    errorOut = "payload does not start with TOMOS,";
+    return false;
+  }
+
+  String value;
+  if (!getFieldValue(payload, "seq", value) || !parseUnsigned32(value, out.seq)) {
+    errorOut = "missing or invalid seq";
+    return false;
+  }
+
+  if (!getFieldValue(payload, "fix", value) || (value != "0" && value != "1")) {
+    errorOut = "missing or invalid fix";
+    return false;
+  }
+  out.fix = value == "1";
+
+  if (!getFieldValue(payload, "lat", value) || !parseDoubleValue(value, out.latitude)) {
+    errorOut = "missing or invalid lat";
+    return false;
+  }
+  if (!getFieldValue(payload, "lon", value) || !parseDoubleValue(value, out.longitude)) {
+    errorOut = "missing or invalid lon";
+    return false;
+  }
+  if (!getFieldValue(payload, "spd", value) || !parseFloatValue(value, out.speedKmh)) {
+    errorOut = "missing or invalid spd";
+    return false;
+  }
+  if (!getFieldValue(payload, "max", value) || !parseFloatValue(value, out.maxSpeedKmh)) {
+    errorOut = "missing or invalid max";
+    return false;
+  }
+  if (!getFieldValue(payload, "sat", value) || !parseIntValue(value, out.satellites)) {
+    errorOut = "missing or invalid sat";
+    return false;
+  }
+  if (!getFieldValue(payload, "hdop", value) || !parseFloatValue(value, out.hdop)) {
+    errorOut = "missing or invalid hdop";
+    return false;
+  }
+  if (!getFieldValue(payload, "vbat", value) ||
+      !parseFloatValue(value, out.batteryVoltage)) {
+    errorOut = "missing or invalid vbat";
+    return false;
+  }
+  if (!getFieldValue(payload, "time", value) || value.length() > 15) {
+    errorOut = "missing or invalid time";
+    return false;
+  }
+
+  value.toCharArray(out.time, sizeof(out.time));
+  out.time[sizeof(out.time) - 1] = '\0';
+  out.valid = true;
+  return true;
 }
 
 bool parseSeqFromPayload(const String& payload, uint32_t& seqOut) {
@@ -140,14 +295,15 @@ void loop() {
     }
 
     if (hasLastSignal) {
-      Serial.printf("RX status: ok=%lu empty=%lu errors=%lu seq_errors=%lu lost=%lu loss=%.1f%% last_seq=%lu last_rssi=%.1f last_snr=%.1f last_error=%d\n",
+      Serial.printf("RX status: ok=%lu empty=%lu errors=%lu seq_errors=%lu telem_ok=%lu telem_errors=%lu lost=%lu loss=%.1f%% last_seq=%lu last_rssi=%.1f last_snr=%.1f last_error=%d\n",
                     rxOkCount, emptyPacketCount, rxErrorCount, seqParseErrorCount,
-                    lostPacketCount, lossPercent, lastSeq, lastRssi, lastSnr,
-                    lastRadioLibError);
+                    telemetryParseOkCount, telemetryParseErrorCount, lostPacketCount,
+                    lossPercent, lastSeq, lastRssi, lastSnr, lastRadioLibError);
     } else {
-      Serial.printf("RX status: ok=%lu empty=%lu errors=%lu seq_errors=%lu lost=%lu loss=%.1f%% last_seq=%lu last_rssi=n/a last_snr=n/a last_error=%d\n",
+      Serial.printf("RX status: ok=%lu empty=%lu errors=%lu seq_errors=%lu telem_ok=%lu telem_errors=%lu lost=%lu loss=%.1f%% last_seq=%lu last_rssi=n/a last_snr=n/a last_error=%d\n",
                     rxOkCount, emptyPacketCount, rxErrorCount, seqParseErrorCount,
-                    lostPacketCount, lossPercent, lastSeq, lastRadioLibError);
+                    telemetryParseOkCount, telemetryParseErrorCount, lostPacketCount,
+                    lossPercent, lastSeq, lastRadioLibError);
     }
     last_status_print = now;
   }
@@ -178,8 +334,20 @@ void loop() {
       lastSnr = snr;
       hasLastSignal = true;
 
-      uint32_t seq = 0;
-      if (parseSeqFromPayload(payload, seq)) {
+      TomosTelemetry telemetry;
+      String telemetryError;
+      bool telemetryValid = parseTomosTelemetry(payload, telemetry, telemetryError);
+      if (telemetryValid) {
+        lastTelemetry = telemetry;
+        telemetryParseOkCount++;
+      } else {
+        telemetryParseErrorCount++;
+        Serial.printf("TELEM PARSE ERROR: %s\n", telemetryError.c_str());
+      }
+
+      uint32_t seq = telemetry.seq;
+      bool seqValid = telemetryValid || parseSeqFromPayload(payload, seq);
+      if (seqValid) {
         if (!hasLastSeq) {
           lastSeq = seq;
           hasLastSeq = true;
@@ -215,6 +383,12 @@ void loop() {
       Serial.printf("RSSI: %.2f dBm\n", rssi);
       Serial.printf("SNR: %.2f dB\n", snr);
       Serial.printf("Frequency Error: %.2f Hz\n", freq_error);
+      if (telemetryValid) {
+        Serial.printf("TOMOS DATA: fix=%d lat=%.6f lon=%.6f spd=%.1f max=%.1f sat=%d hdop=%.1f vbat=%.2f time=%s\n",
+                      telemetry.fix ? 1 : 0, telemetry.latitude, telemetry.longitude,
+                      telemetry.speedKmh, telemetry.maxSpeedKmh, telemetry.satellites,
+                      telemetry.hdop, telemetry.batteryVoltage, telemetry.time);
+      }
       Serial.printf("LINK: rx_ok=%lu lost=%lu loss=%.1f%% last_seq=%lu seq_errors=%lu\n",
                     rxOkCount, lostPacketCount, lossPercent, lastSeq,
                     seqParseErrorCount);
